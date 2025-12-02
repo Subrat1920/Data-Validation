@@ -1,0 +1,11 @@
+pandas
+numpy
+openpyxl
+tk
+scikit-learn
+matplotlib
+seaborn
+streamlit
+faker
+## cannot use jupyter notebook without this
+ipykernel
