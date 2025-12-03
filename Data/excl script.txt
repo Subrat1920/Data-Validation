@@ -1,0 +1,164 @@
+Step 1: Install required packages inside your virtual environment
+
+In the same PowerShell terminal (with (neha) at the start), run:
+
+pip install pandas openpyxl tk
+
+
+pandas → for Excel data handling
+
+openpyxl → to write Excel files and
+
+
+tk → for file selection popups
+
+You don’t need sudo or anything else since you’re inside a virtual environment.
+
+⭐ Step 2: Verify installation
+pip show pandas
+pip show openpyxl
+pip show tk
+
+
+⭐ Step 3: Prepare your script
+
+Open a text editor (Notepad/VS Code).
+
+Copy the compare_reports.py code (with row order check) I shared.
+
+Save it in your project folder (e.g., C:\Users\Neha\Desktop\practice) as:
+
+compare_reports.py
+
+⭐ Step 4: Run your script
+
+In PowerShell (still in the (neha) environment):
+
+python compare_reports.py
+
+
+First popup → select SplashBI report
+
+Second popup → select Express report
+
+Output will be generated in the same folder:
+
+mismatch_report.xlsx → highlights differences
+
+summary.txt → shows PASS / FAIL messages
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename
+import os
+
+# Hide Tkinter root window
+Tk().withdraw()
+
+# Step 1: Select SplashBI file
+print("Select SplashBI report:")
+file1 = askopenfilename(title="Select SplashBI report", filetypes=[("Excel files","*.xlsx *.xls")])
+if not file1:
+    print("No file selected. Exiting...")
+    exit()
+
+# Step 2: Select Express file
+print("Select Express report:")
+file2 = askopenfilename(title="Select Express report", filetypes=[("Excel files","*.xlsx *.xls")])
+if not file2:
+    print("No file selected. Exiting...")
+    exit()
+
+# Step 3: Read Excel files
+df1 = pd.read_excel(file1)
+df2 = pd.read_excel(file2)
+
+summary = []
+
+# Step 4: Compare columns
+if list(df1.columns) == list(df2.columns):
+    summary.append("✓ Columns MATCH")
+else:
+    summary.append("✗ Columns DO NOT MATCH")
+    summary.append(f"File1 Columns: {list(df1.columns)}")
+    summary.append(f"File2 Columns: {list(df2.columns)}")
+
+# Step 5: Compare row count
+if len(df1) == len(df2):
+    summary.append("✓ Row Count MATCH")
+else:
+    summary.append("✗ Row Count MISMATCH")
+
+# Step 6: Compare row order
+if df1.equals(df2):
+    summary.append("✓ Row order MATCH")
+    row_order_mismatch = False
+else:
+    summary.append("✗ Row order OR data mismatch detected")
+    row_order_mismatch = True
+
+# Step 7: Compare numeric totals
+numeric_cols = df1.select_dtypes(include=["int64","float64"]).columns
+for col in numeric_cols:
+    if df1[col].sum() == df2[col].sum():
+        summary.append(f"✓ Total MATCH for: {col}")
+    else:
+        summary.append(f"✗ Total MISMATCH for: {col}")
+
+# Step 8: Cell-by-cell comparison
+comparison = df1.eq(df2)
+output_file = os.path.join(os.path.dirname(file1), "output", "mismatch_report.xlsx")
+os.makedirs(os.path.dirname(output_file), exist_ok=True)
+df1.to_excel(output_file, index=False)
+
+wb = load_workbook(output_file)
+ws = wb.active
+red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+
+mismatch_found = row_order_mismatch  # mark mismatch if row order already wrong
+
+for r in range(len(df1)):
+    for c in range(len(df1.columns)):
+        if not comparison.iat[r,c]:
+            ws.cell(row=r+2, column=c+1).fill = red_fill
+            mismatch_found = True
+
+wb.save(output_file)
+
+# Step 9: Save summary
+summary_file = os.path.join(os.path.dirname(file1), "output", "summary.txt")
+with open(summary_file, "w") as f:
+    for line in summary:
+        f.write(line + "\n")
+
+# Step 10: Final message
+if mismatch_found:
+    print(f"✗ Differences Found → Check {output_file}")
+else:
+    print(f"✓ Both Files Match perfectly including row order")
+
+print(f"Summary saved in {summary_file}")

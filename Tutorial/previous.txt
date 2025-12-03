@@ -1,0 +1,426 @@
+# app.py
+import streamlit as st
+import pandas as pd
+import json
+import re
+from io import BytesIO
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+import os
+import base64
+
+st.set_page_config(page_title="Excel Comparator & Validator", layout="wide")
+
+# ---------------- DEFAULT CONFIG ---------------- #
+DEFAULT_CONFIG = {
+    "required_columns": [],
+    "expected_column_order": [],
+    "expected_dtypes": {},
+    "primary_key": None,
+    "expected_min_rows": None,
+    "expected_max_rows": None,
+    "max_missing_ratio_per_column": 0.2,
+    "value_ranges": {},
+    "regex_patterns": {},
+    "allowed_categories": {},
+    "unique_columns": [],
+    "business_rules": {},  # can't be directly edited as lambda via UI
+    "filename_pattern": None,
+    "min_file_size_bytes": None,
+    "max_file_size_bytes": None,
+    "expected_sheet_names": None
+}
+
+# ---------------- HELPERS (adapted from your script) ---------------- #
+def map_pd_dtype_to_expected(pd_dtype):
+    """Mapping the selected Excel File column data type into simple strings"""
+    if pd.api.types.is_integer_dtype(pd_dtype):
+        return "int"
+    if pd.api.types.is_float_dtype(pd_dtype):
+        return "float"
+    if pd.api.types.is_bool_dtype(pd_dtype):
+        return "bool"
+    if pd.api.types.is_datetime64_any_dtype(pd_dtype):
+        return "datetime"
+    return "str"
+
+def add_issue_row_list(issue_list, issue_type, row, col, details):
+    issue_list.append({"IssueType": issue_type, "RowNumber": row, "ColumnName": col, "Details": details})
+
+def validate_columns(df, summary, issues_list, cfg):
+    cols = list(df.columns)
+    required = cfg.get("required_columns") or []
+    missing = [c for c in required if c not in cols]
+    unexpected = [c for c in cols if required and c not in required]
+
+    if missing:
+        msg = f"✗ Missing required columns: {missing}"
+        summary.append(msg)
+        add_issue_row_list(issues_list, "MissingColumn", "", "", msg)
+    else:
+        if required:
+            summary.append("✓ All required columns present")
+
+    if unexpected:
+        msg = f"⚠ Unexpected columns present: {unexpected}"
+        summary.append(msg)
+        add_issue_row_list(issues_list, "UnexpectedColumn", "", "", msg)
+
+    expected_order = cfg.get("expected_column_order") or []
+    if expected_order:
+        if cols == expected_order:
+            summary.append("✓ Column order matches expected")
+        else:
+            summary.append("✗ Column order DOES NOT match expected")
+            for idx, col in enumerate(cols):
+                if col in expected_order:
+                    expected_idx = expected_order.index(col)
+                    if expected_idx != idx:
+                        details = f"Column '{col}': expected index {expected_idx}, found at index {idx}"
+                        add_issue_row_list(issues_list, "ColumnOrderMismatch", "", col, details)
+
+    expected_dtypes = cfg.get("expected_dtypes") or {}
+    for col in expected_dtypes:
+        if col not in df.columns:
+            continue
+        actual_pd_dtype = df[col].dtype
+        actual_simple = map_pd_dtype_to_expected(actual_pd_dtype)
+        expected_simple = expected_dtypes[col]
+        if actual_simple != expected_simple:
+            msg = (f"✗ Datatype mismatch for '{col}': expected {expected_simple}, "
+                   f"found {actual_simple} (pandas dtype {actual_pd_dtype})")
+            summary.append(msg)
+            add_issue_row_list(issues_list, "ColumnTypeMismatch", "", col, msg)
+
+def validate_rows(df1, df2, summary, issues_list, cfg):
+    n_rows = len(df1)
+    min_rows = cfg.get("expected_min_rows")
+    max_rows = cfg.get("expected_max_rows")
+
+    if min_rows is not None and n_rows < min_rows:
+        msg = f"✗ Row count {n_rows} below expected minimum {min_rows}"
+        summary.append(msg)
+        add_issue_row_list(issues_list, "RowCountBelowMin", "", "", msg)
+    if max_rows is not None and n_rows > max_rows:
+        msg = f"✗ Row count {n_rows} above expected maximum {max_rows}"
+        summary.append(msg)
+        add_issue_row_list(issues_list, "RowCountAboveMax", "", "", msg)
+
+    pk = cfg.get("primary_key")
+    if pk and pk in df1.columns and pk in df2.columns:
+        if df1[pk].isnull().any() or df2[pk].isnull().any():
+            summary.append(f"⚠ Primary key '{pk}' contains nulls; order check may be unreliable.")
+        else:
+            order1 = list(df1[pk])
+            order2 = list(df2[pk])
+            if order1 == order2:
+                summary.append(f"✓ Row order MATCH based on primary key '{pk}'")
+            else:
+                summary.append(f"✗ Row order mismatch based on primary key '{pk}'")
+                for i, (v1, v2) in enumerate(zip(order1, order2)):
+                    if v1 != v2:
+                        details = f"Row {i+1}: SplashBI {pk}={v1}, Express {pk}={v2}"
+                        add_issue_row_list(issues_list, "RowOrderMismatch", i + 2, pk, details)
+
+        missing_in_df2 = set(df1[pk]) - set(df2[pk])
+        missing_in_df1 = set(df2[pk]) - set(df1[pk])
+        if missing_in_df2:
+            msg = f"✗ {len(missing_in_df2)} rows present in SplashBI but missing in Express based on '{pk}'"
+            summary.append(msg)
+            for val in list(missing_in_df2)[:100]:
+                add_issue_row_list(issues_list, "MissingRowInExpress", "", pk, f"{pk}={val}")
+        if missing_in_df1:
+            msg = f"✗ {len(missing_in_df1)} rows present in Express but missing in SplashBI based on '{pk}'"
+            summary.append(msg)
+            for val in list(missing_in_df1)[:100]:
+                add_issue_row_list(issues_list, "MissingRowInSplashBI", "", pk, f"{pk}={val}")
+
+def validate_missing_data(df, summary, issues_list, cfg):
+    max_ratio = cfg.get("max_missing_ratio_per_column", 1.0)
+    total_rows = len(df)
+    if total_rows == 0:
+        return
+    summary.append("— Missing data per column —")
+    for col in df.columns:
+        missing_count = df[col].isna().sum()
+        if missing_count == 0:
+            continue
+        ratio = missing_count / total_rows
+        msg = f"Column '{col}': {missing_count} missing ({ratio:.2%})"
+        summary.append(msg)
+        add_issue_row_list(issues_list, "MissingData", "", col, msg)
+        if ratio > max_ratio:
+            warn = (f"✗ Column '{col}' missing ratio {ratio:.2%} "
+                    f"exceeds threshold {max_ratio:.2%}")
+            summary.append(warn)
+            add_issue_row_list(issues_list, "MissingDataHigh", "", col, warn)
+
+def validate_duplicates(df, summary, issues_list, cfg):
+    duplicate_rows = df.duplicated(keep=False)
+    if duplicate_rows.any():
+        count = duplicate_rows.sum()
+        msg = f"✗ {count} duplicate rows found"
+        summary.append(msg)
+        for idx in df.index[duplicate_rows][:100]:
+            add_issue_row_list(issues_list, "DuplicateRow", idx + 2, "", "Duplicate row")
+    else:
+        summary.append("✓ No duplicate rows")
+
+    unique_cols = list(cfg.get("unique_columns") or [])
+    pk = cfg.get("primary_key")
+    if pk and pk not in unique_cols:
+        unique_cols.append(pk)
+
+    for col in unique_cols:
+        if col not in df.columns:
+            continue
+        dup = df[col].duplicated(keep=False)
+        if dup.any():
+            count = dup.sum()
+            msg = f"✗ {count} duplicate values in '{col}' (must be unique)"
+            summary.append(msg)
+            for idx, val in zip(df.index[dup][:100], df.loc[dup, col].head(100)):
+                add_issue_row_list(issues_list, "DuplicateKey", idx + 2, col, f"Value '{val}' duplicated")
+        else:
+            summary.append(f"✓ Column '{col}' has unique values")
+
+def validate_value_constraints(df, summary, issues_list, cfg):
+    ranges = cfg.get("value_ranges") or {}
+    for col, bounds in ranges.items():
+        if col not in df.columns:
+            continue
+        min_val, max_val = bounds if isinstance(bounds, (list, tuple)) and len(bounds)==2 else (None, None)
+        series = df[col]
+        if min_val is not None:
+            mask = series < min_val
+            if mask.any():
+                count = mask.sum()
+                msg = f"✗ {count} values in '{col}' below minimum {min_val}"
+                summary.append(msg)
+                for idx, val in zip(series[mask].index[:100], series[mask].head(100)):
+                    add_issue_row_list(issues_list, "ValueBelowMin", idx + 2, col, f"{val} < {min_val}")
+        if max_val is not None:
+            mask = series > max_val
+            if mask.any():
+                count = mask.sum()
+                msg = f"✗ {count} values in '{col}' above maximum {max_val}"
+                summary.append(msg)
+                for idx, val in zip(series[mask].index[:100], series[mask].head(100)):
+                    add_issue_row_list(issues_list, "ValueAboveMax", idx + 2, col, f"{val} > {max_val}")
+
+    regex_patterns = cfg.get("regex_patterns") or {}
+    for col, pattern in regex_patterns.items():
+        if col not in df.columns:
+            continue
+        try:
+            regex = re.compile(pattern)
+        except Exception as e:
+            summary.append(f"⚠ Invalid regex for '{col}': {e}")
+            continue
+        mask = ~df[col].astype(str).fillna("").str.match(regex)
+        mask &= df[col].notna()
+        if mask.any():
+            count = mask.sum()
+            msg = f"✗ {count} values in '{col}' do not match regex '{pattern}'"
+            summary.append(msg)
+            for idx, val in zip(df.index[mask][:100], df.loc[mask, col].head(100)):
+                add_issue_row_list(issues_list, "RegexMismatch", idx + 2, col, f"Value '{val}' fails pattern")
+
+    business_rules = cfg.get("business_rules") or {}
+    # Note: UI editing for business rules not supported; skip evaluating non-callable rules.
+    for rule_name, rule_def in business_rules.items():
+        summary.append(f"⚠ Business rule '{rule_name}' present in config but cannot be evaluated in UI.")
+
+def validate_file_level(uploaded_file, filename, summary, issues_list, cfg):
+    pattern = cfg.get("filename_pattern")
+    if pattern:
+        if not re.match(pattern, filename):
+            msg = f"✗ Filename '{filename}' does not match expected pattern '{pattern}'"
+            summary.append(msg)
+            add_issue_row_list(issues_list, "FilenamePatternMismatch", "", "", msg)
+        else:
+            summary.append("✓ Filename pattern OK")
+
+    size = len(uploaded_file.getvalue()) if hasattr(uploaded_file, "getvalue") else None
+    min_size = cfg.get("min_file_size_bytes")
+    max_size = cfg.get("max_file_size_bytes")
+    if min_size is not None and size is not None and size < min_size:
+        msg = f"✗ File size {size} bytes below minimum {min_size}"
+        summary.append(msg)
+        add_issue_row_list(issues_list, "FileTooSmall", "", "", msg)
+    if max_size is not None and size is not None and size > max_size:
+        msg = f"✗ File size {size} bytes above maximum {max_size}"
+        summary.append(msg)
+        add_issue_row_list(issues_list, "FileTooLarge", "", "", msg)
+
+    expected_sheets = cfg.get("expected_sheet_names")
+    if expected_sheets:
+        try:
+            xls = pd.ExcelFile(uploaded_file)
+            actual_sheets = xls.sheet_names
+            missing = [s for s in expected_sheets if s not in actual_sheets]
+            extra = [s for s in actual_sheets if s not in expected_sheets]
+            if missing:
+                msg = f"✗ Missing expected sheets: {missing}"
+                summary.append(msg)
+                add_issue_row_list(issues_list, "MissingSheet", "", "", msg)
+            if extra:
+                msg = f"⚠ Extra sheets present: {extra}"
+                summary.append(msg)
+                add_issue_row_list(issues_list, "ExtraSheet", "", "", msg)
+            if not missing and not extra:
+                summary.append("✓ Sheet names match expected")
+        except Exception as e:
+            summary.append(f"⚠ Could not inspect sheet names: {e}")
+
+# ---------------- UI ---------------- #
+st.title("Excel Comparator & Validator (SplashBI vs Express)")
+st.markdown("Upload two Excel reports, tune the validation config in the sidebar, then run checks.")
+
+with st.sidebar:
+    st.header("Validation Config (JSON)")
+    cfg_text = st.text_area("Edit JSON config (leave empty to use defaults)", height=320,
+                            value=json.dumps(DEFAULT_CONFIG, indent=2))
+    try:
+        VALIDATION_CONFIG = json.loads(cfg_text) if cfg_text.strip() else DEFAULT_CONFIG
+    except Exception as e:
+        st.error(f"Invalid JSON in config: {e}")
+        st.stop()
+
+st.write("### 1) Upload files")
+col1, col2 = st.columns(2)
+with col1:
+    uploaded1 = st.file_uploader("Select SplashBI report (xlsx/xls)", type=["xlsx", "xls"], key="splash")
+with col2:
+    uploaded2 = st.file_uploader("Select Express report (xlsx/xls)", type=["xlsx", "xls"], key="express")
+
+run_btn = st.button("Run Validation & Compare")
+
+if run_btn:
+    if not uploaded1 or not uploaded2:
+        st.warning("Please upload both files.")
+        st.stop()
+
+    try:
+        with st.spinner("Reading Excel files..."):
+            df1 = pd.read_excel(uploaded1)
+            # reset buffer pointer for second read if using same BytesIO? uploaded2 is separate
+            df2 = pd.read_excel(uploaded2)
+    except Exception as e:
+        st.error(f"Error reading files: {e}")
+        st.stop()
+
+    summary = []
+    issues_list = []
+
+    # Column comparison
+    if list(df1.columns) == list(df2.columns):
+        summary.append("✓ Columns MATCH between SplashBI and Express")
+    else:
+        summary.append("✗ Columns DO NOT MATCH between SplashBI and Express")
+        summary.append(f"SplashBI Columns: {list(df1.columns)}")
+        summary.append(f"Express Columns: {list(df2.columns)}")
+
+    # Row count
+    if len(df1) == len(df2):
+        summary.append("✓ Row Count MATCH between SplashBI and Express")
+    else:
+        summary.append("✗ Row Count MISMATCH between SplashBI and Express")
+
+    # Exact equality
+    if df1.equals(df2):
+        summary.append("✓ Row order + data MATCH exactly")
+        row_order_mismatch = False
+    else:
+        summary.append("✗ Row order OR data mismatch detected")
+        row_order_mismatch = True
+
+    # Numeric totals
+    numeric_cols = df1.select_dtypes(include=["int64", "float64"]).columns
+    for col in numeric_cols:
+        if col in df2.columns and pd.notna(df1[col].sum()) and pd.notna(df2[col].sum()) and df1[col].sum() == df2[col].sum():
+            summary.append(f"✓ Total MATCH for: {col}")
+        else:
+            summary.append(f"✗ Total MISMATCH for: {col}")
+
+    # Build mismatch workbook in-memory
+    out_bytes = BytesIO()
+    df1.to_excel(out_bytes, index=False, sheet_name="SplashBI")
+    out_bytes.seek(0)
+    wb = load_workbook(out_bytes)
+    ws = wb.active
+    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+
+    # cell-by-cell compare (works for overlapping dims; out-of-bounds flagged)
+    comparison = df1.eq(df2)
+    mismatch_found = row_order_mismatch
+    rows = len(df1)
+    cols = len(df1.columns)
+    for r in range(rows):
+        for c in range(cols):
+            if c >= df2.shape[1] or r >= df2.shape[0]:
+                ws.cell(row=r + 2, column=c + 1).fill = red_fill
+                mismatch_found = True
+            else:
+                if not comparison.iat[r, c]:
+                    ws.cell(row=r + 2, column=c + 1).fill = red_fill
+                    mismatch_found = True
+
+    # Validation sheet (issues)
+    issues_ws = wb.create_sheet("ValidationIssues")
+    issues_ws.append(["IssueType", "RowNumber", "ColumnName", "Details"])
+
+    # Column-level validation
+    validate_columns(df1, summary, issues_list, VALIDATION_CONFIG)
+    # Row-level validation
+    validate_rows(df1, df2, summary, issues_list, VALIDATION_CONFIG)
+    # Missing & duplicates
+    validate_missing_data(df1, summary, issues_list, VALIDATION_CONFIG)
+    validate_duplicates(df1, summary, issues_list, VALIDATION_CONFIG)
+    # Value constraints & business rules
+    validate_value_constraints(df1, summary, issues_list, VALIDATION_CONFIG)
+    # File-level validation (we pass uploaded buffer and filename)
+    validate_file_level(uploaded1, getattr(uploaded1, "name", "uploaded1.xlsx"), summary, issues_list, VALIDATION_CONFIG)
+
+    # Append issues to ValidationIssues sheet
+    for issue in issues_list:
+        issues_ws.append([issue["IssueType"], issue["RowNumber"], issue["ColumnName"], issue["Details"]])
+
+    # Save workbook back to bytes
+    out_stream = BytesIO()
+    wb.save(out_stream)
+    out_stream.seek(0)
+
+    # Summary text file bytes
+    summary_text = "\n".join(summary)
+    summary_bytes = summary_text.encode("utf-8")
+
+    # Show results
+    st.subheader("Summary")
+    status = "Differences Found" if mismatch_found else "Files Match"
+    if mismatch_found:
+        st.error(f"✗ Differences Found → see downloads below")
+    else:
+        st.success("✓ Both Files Match perfectly including row order")
+
+    st.code(summary_text, language=None)
+
+    st.subheader("Validation Issues (table)")
+    if issues_list:
+        df_issues = pd.DataFrame(issues_list)
+        st.dataframe(df_issues)
+    else:
+        st.info("No validation issues recorded.")
+
+    # Provide downloads
+    st.subheader("Downloads")
+    st.download_button("Download mismatch_report.xlsx", data=out_stream.getvalue(), file_name="mismatch_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download summary.txt", data=summary_bytes, file_name="summary.txt", mime="text/plain")
+
+    # Also show preview of first few rows of SplashBI file and Express
+    with st.expander("Preview: SplashBI (first 5 rows)"):
+        st.dataframe(df1.head())
+    with st.expander("Preview: Express (first 5 rows)"):
+        st.dataframe(df2.head())
+
+    st.balloons()
