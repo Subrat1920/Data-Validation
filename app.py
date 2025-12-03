@@ -312,6 +312,29 @@ with col1:
 with col2:
     uploaded2 = st.file_uploader("Select Express report (xlsx/xls)", type=["xlsx", "xls"], key="express")
 
+# Prepare placeholders for sheet selections
+xl1_selected_sheet = None
+xl2_selected_sheet = None
+
+# Only try to inspect sheets if file(s) uploaded
+if uploaded1:
+    try:
+        bytes1 = uploaded1.read()
+        xls1 = pd.ExcelFile(BytesIO(bytes1))
+        xl1_sheets = xls1.sheet_names
+        xl1_selected_sheet = st.selectbox("Select a sheet for Excel File 1 (SplashBI)", xl1_sheets, key="sheet1")
+    except Exception as e:
+        st.error(f"Could not read SplashBI file sheets: {e}")
+
+if uploaded2:
+    try:
+        bytes2 = uploaded2.read()
+        xls2 = pd.ExcelFile(BytesIO(bytes2))
+        xl2_sheets = xls2.sheet_names
+        xl2_selected_sheet = st.selectbox("Select a sheet for Excel File 2 (Express)", xl2_sheets, key="sheet2")
+    except Exception as e:
+        st.error(f"Could not read Express file sheets: {e}")
+
 run_btn = st.button("Run Validation & Compare")
 
 if run_btn:
@@ -319,10 +342,27 @@ if run_btn:
         st.warning("Please upload both files.")
         st.stop()
 
+    # ensure we still have sheet selection; fallback to first sheet if user didn't select
     try:
+        # if we earlier read the uploads for sheet lists, bytes1/bytes2 exist; if not, read now
+        if 'bytes1' not in locals():
+            bytes1 = uploaded1.read()
+        if 'bytes2' not in locals():
+            bytes2 = uploaded2.read()
+
         with st.spinner("Reading Excel files..."):
-            df1 = pd.read_excel(uploaded1)
-            df2 = pd.read_excel(uploaded2)
+            # create ExcelFile from fresh BytesIO objects so stream positions are independent
+            xl1 = pd.ExcelFile(BytesIO(bytes1))
+            xl2 = pd.ExcelFile(BytesIO(bytes2))
+            # fallback to first sheet if user didn't choose
+            if not xl1_selected_sheet:
+                xl1_selected_sheet = xl1.sheet_names[0]
+            if not xl2_selected_sheet:
+                xl2_selected_sheet = xl2.sheet_names[0]
+
+            # read sheets using fresh BytesIO objects
+            df1 = pd.read_excel(BytesIO(bytes1), sheet_name=xl1_selected_sheet)
+            df2 = pd.read_excel(BytesIO(bytes2), sheet_name=xl2_selected_sheet)
     except Exception as e:
         st.error(f"Error reading files: {e}")
         st.stop()
